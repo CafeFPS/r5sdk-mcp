@@ -1,7 +1,7 @@
 {
   "name": "r5sdk-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for R5SDK listen server control via RCON",
+  "version": "2.0.0",
+  "description": "MCP server giving an AI agent full control of a local R5 SDK game through the SDK agent link",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

@@ -1,728 +1,703 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { RconClient } from "./rcon.js";
-import { parseStatus, parseConVar, parseCvarList } from "./parsers.js";
+import * as path from "node:path";
+import { AgentLink, LinkError, type ExecResult, type LogLine } from "./link.js";
+import { captureGameWindow } from "./screenshot.js";
+import { GUIDE } from "./guide.js";
 
-// --- Configuration ---
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
-const RCON_HOST = process.env.R5_RCON_HOST ?? "127.0.0.1";
-const RCON_PORT = parseInt(process.env.R5_RCON_PORT ?? "37015", 10);
-const RCON_PASSWORD = process.env.R5_RCON_PASSWORD ?? "";
+function env(name: string, fallback: string): string {
+  const v = process.env[name];
+  return v !== undefined && v !== "" ? v : fallback;
+}
 
-// --- RCON client singleton ---
+const GAME_DIR = env("R5_GAME_DIR", process.cwd());
+const PLATFORM_DIR = path.join(GAME_DIR, "platform");
 
-const rcon = new RconClient({
-  host: RCON_HOST,
-  port: RCON_PORT,
-  password: RCON_PASSWORD,
+const serverLink = new AgentLink({
+  role: "server",
+  host: "127.0.0.1",
+  port: Number(env("R5_SERVER_LINK_PORT", "37019")),
+  tokenFile: env("R5_SERVER_TOKEN_FILE", path.join(PLATFORM_DIR, "agentlink.token")),
 });
 
-rcon.on("error", (err: Error) => {
-  process.stderr.write(`[r5sdk-mcp] RCON error: ${err.message}\n`);
+const clientLink = new AgentLink({
+  role: "client",
+  host: "127.0.0.1",
+  port: Number(env("R5_CLIENT_LINK_PORT", "37020")),
+  tokenFile: env("R5_CLIENT_TOKEN_FILE", path.join(PLATFORM_DIR, "agentlink_client.token")),
 });
 
-rcon.on("disconnected", () => {
-  process.stderr.write("[r5sdk-mcp] RCON disconnected, will reconnect...\n");
-});
+const CLIENT_PROCESS = env("R5_CLIENT_PROCESS", "r5apex");
 
-// --- MCP Server ---
+function link(target: "server" | "client"): AgentLink {
+  return target === "server" ? serverLink : clientLink;
+}
 
-const server = new McpServer({
-  name: "r5sdk",
-  version: "1.0.0",
-});
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-// ============================================================
-// TOOLS
-// ============================================================
+function text(value: unknown) {
+  const body = typeof value === "string" ? value : JSON.stringify(value, null, 1);
+  return { content: [{ type: "text" as const, text: body }] };
+}
 
-// --- Connection management ---
+function failure(value: unknown) {
+  return { ...text(value), isError: true as const };
+}
 
-server.tool(
-  "connect",
-  "Connect to the R5SDK RCON server. Uses env vars R5_RCON_HOST, R5_RCON_PORT, R5_RCON_PASSWORD by default.",
-  {
-    host: z.string().optional().describe("RCON host (default: 127.0.0.1)"),
-    port: z.number().optional().describe("RCON port (default: 37015)"),
-    password: z.string().optional().describe("RCON password"),
-  },
-  async ({ host, port, password }) => {
-    if (host) (rcon as any).config.host = host;
-    if (port) (rcon as any).config.port = port;
-    if (password) (rcon as any).config.password = password;
+function asError(err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  return failure({ ok: false, error: message, hint: err instanceof LinkError ? "call the status tool for link details" : undefined });
+}
 
+// Squirrel string literal.
+function sq(s: string): string {
+  return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r?\n/g, " ") + '"';
+}
+
+function sqVec(v: [number, number, number]): string {
+  return `<${v.map((n) => Number(n).toFixed(3)).join(", ")}>`;
+}
+
+function sqAsset(p: string): string {
+  if (!/^[\w\/.\-]+$/.test(p)) throw new Error(`bad asset path '${p}'`);
+  return `$"${p}"`;
+}
+
+async function serverCall(code: string, timeoutMs?: number) {
+  const r = await serverLink.call("server", code, timeoutMs);
+  return r?.ok === false ? failure(r) : text(r);
+}
+
+function summarizeExec(r: ExecResult) {
+  return {
+    ok: r.ok && !r.error,
+    ran: r.ran,
+    error: r.error,
+    reply: r.reply,
+    message: r.message,
+    output: r.log.map((l) => (l.level === "info" ? l.text : `[${l.level}] ${l.text}`)),
+    outputDropped: r.logDropped || undefined,
+  };
+}
+
+const whoSchema = z
+  .string()
+  .default("me")
+  .describe('Player selector: "me" (first human), "all", "humans", "bots", "#<playerIndex>", or a player name');
+
+// ---------------------------------------------------------------------------
+// Place names: the server matches localization tokens; when the client link
+// is up we also match the localized names the player actually reads.
+// ---------------------------------------------------------------------------
+
+interface Place {
+  name: string;
+  token: string;
+  kind: string;
+  origin: [number, number, number];
+  tier?: number;
+  displayName?: string;
+}
+
+const placeCache = new Map<string, Place[]>();
+
+async function loadPlaces(): Promise<{ map: string; places: Place[] }> {
+  const r = await serverLink.call("server", "Agent_Places()");
+  if (!r.ok) throw new Error(r.error ?? "Agent_Places failed");
+  const map: string = r.map;
+  const places: Place[] = r.places;
+  const cached = placeCache.get(map);
+  if (cached && cached.length === places.length) return { map, places: cached };
+
+  const tokens = places.map((p) => p.token).filter((t) => t.startsWith("#"));
+  if (tokens.length && clientLink.isConnected()) {
     try {
-      await rcon.connect();
-      return { content: [{ type: "text", text: `Connected to ${(rcon as any).config.host}:${(rcon as any).config.port}` }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Connection failed: ${(err as Error).message}` }], isError: true };
+      const loc = await clientLink.call("client", `AgentCl_Localize( [ ${tokens.map(sq).join(", ")} ] )`);
+      if (loc.ok) for (const p of places) p.displayName = loc.names[p.token] ?? undefined;
+    } catch {
+      // Localized names are a bonus; tokens still match.
     }
+  }
+  placeCache.set(map, places);
+  return { map, places };
+}
+
+function words(s: string): string[] {
+  return s.toLowerCase().replace(/#/g, "").split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+function scorePlace(p: Place, query: string[]): number {
+  const hay = words(`${p.displayName ?? ""} ${p.name} ${p.token}`);
+  let score = 0;
+  for (const q of query) {
+    let best = 0;
+    for (const w of hay) {
+      if (w === q) best = Math.max(best, 10);
+      else if (w.startsWith(q)) best = Math.max(best, 6);
+      else if (w.includes(q)) best = Math.max(best, 3);
+    }
+    if (!best) return 0;
+    score += best;
+  }
+  const full = query.join(" ");
+  if ((p.displayName ?? "").toLowerCase() === full || p.name === full) score += 20;
+  return score;
+}
+
+function matchPlaces(places: Place[], query: string, n = 5) {
+  const q = words(query);
+  return places
+    .map((p) => ({ p, score: scorePlace(p, q) }))
+    .filter((m) => m.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, n)
+    .map((m) => ({ ...m.p, score: m.score }));
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+const server = new McpServer(
+  { name: "r5sdk", version: "2.0.0" },
+  {
+    instructions:
+      "Full control of a local R5 SDK Apex game (dedicated server + client). Read the `guide` tool (or r5://guide) first; call `state` to see the map and players. Use typed tools (teleport, give, set_legend, spawn, ...) before raw `console`/`script`.",
   }
 );
 
+server.tool("guide", "How this game is organised and how to drive it: links, player/place selectors, units, map changes. Read once per session.", {}, async () => text(GUIDE));
+
 server.tool(
-  "disconnect",
-  "Disconnect from the RCON server.",
+  "status",
+  "Connection state of the server and client links, with their protocol info. Use this when a tool reports a link error.",
   {},
   async () => {
-    rcon.disconnect();
-    return { content: [{ type: "text", text: "Disconnected" }] };
-  }
-);
-
-// --- Console command execution ---
-
-server.tool(
-  "exec",
-  "Execute a console command on the game server and return its output.",
-  {
-    command: z.string().describe("Console command to execute (e.g. 'status', 'map mp_rr_canyonlands_staging')"),
-    timeout: z.number().optional().describe("Response collection timeout in ms (default: 2000)"),
-  },
-  async ({ command, timeout }) => {
-    try {
-      const output = await rcon.exec(command, timeout ?? 2000);
-      return { content: [{ type: "text", text: output || "(no output)" }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
+    const out: Record<string, unknown> = { gameDir: GAME_DIR };
+    for (const l of [serverLink, clientLink]) {
+      try {
+        out[l.config.role] = { connected: true, ...(await l.info()) };
+      } catch (err) {
+        out[l.config.role] = { connected: false, port: l.config.port, tokenFile: l.config.tokenFile, error: (err as Error).message };
+      }
     }
+    return text(out);
   }
 );
 
-server.tool(
-  "exec_script",
-  "Execute VScript code on a specific VM (server, client, or ui).",
-  {
-    vm: z.enum(["server", "client", "ui"]).describe("Which script VM to target"),
-    code: z.string().describe("VScript code to execute"),
-  },
-  async ({ vm, code }) => {
-    const cmdMap = { server: "script", client: "script_client", ui: "script_ui" };
-    const cmd = `${cmdMap[vm]} ${code}`;
-    try {
-      const output = await rcon.exec(cmd, 3000);
-      return { content: [{ type: "text", text: output || "(no output)" }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-// --- Console log ---
+// --- observe ---------------------------------------------------------------
 
 server.tool(
-  "get_console_log",
-  "Get recent console log output from the game.",
-  {
-    lines: z.number().optional().describe("Number of recent lines to return (default: 100, max: 5000)"),
-  },
-  async ({ lines }) => {
-    const count = Math.min(lines ?? 100, 5000);
-    const logLines = rcon.getRecentLog(count);
-    return { content: [{ type: "text", text: logLines.join("") || "(no log data)" }] };
-  }
-);
-
-server.tool(
-  "clear_console_log",
-  "Clear the captured console log buffer.",
+  "state",
+  "Snapshot of the match: map, playlist, game state, ring, and every player (origin, eye angles, health, shield, legend, weapons, zone). Includes the client's own view when the client link is up.",
   {},
   async () => {
-    rcon.clearLog();
-    return { content: [{ type: "text", text: "Console log buffer cleared" }] };
+    try {
+      const s = await serverLink.call("server", "Agent_State()");
+      if (clientLink.isConnected() || (await clientLink.ensure().then(() => true).catch(() => false))) {
+        try {
+          s.client = await clientLink.call("client", "AgentCl_State()");
+        } catch (err) {
+          s.client = { ok: false, error: (err as Error).message };
+        }
+      }
+      return s.ok === false ? failure(s) : text(s);
+    } catch (err) {
+      return asError(err);
+    }
   }
 );
 
-// --- Server lifecycle ---
+server.tool("players", "All players with position, health, shield, legend, weapons and zone.", {}, async () => {
+  try {
+    return await serverCall("Agent_Players()");
+  } catch (err) {
+    return asError(err);
+  }
+});
 
 server.tool(
-  "start_server",
-  "Start a listen server on the specified map and playlist.",
+  "places",
+  "Named places on the current map (zones, spawn points, saved places) with world origins. Localized display names are included when the client link is up.",
+  { filter: z.string().optional().describe("Only places whose name contains this text") },
+  async ({ filter }) => {
+    try {
+      const { map, places } = await loadPlaces();
+      const f = (filter ?? "").toLowerCase();
+      const list = f ? places.filter((p) => `${p.displayName ?? ""} ${p.name} ${p.token}`.toLowerCase().includes(f)) : places;
+      return text({ ok: true, map, count: list.length, places: list });
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "find_place",
+  "Resolve a spoken place name (e.g. 'fragment', 'skyhook', 'the pit') to candidate locations on the current map, best first.",
+  { query: z.string() },
+  async ({ query }) => {
+    try {
+      const { map, places } = await loadPlaces();
+      const matches = matchPlaces(places, query);
+      return matches.length ? text({ ok: true, map, query, matches }) : failure({ ok: false, map, query, error: "no match", hint: "call places to list every place" });
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "save_place",
+  "Remember a player's current position under a name so teleport/spawn can use it (lives until the map changes).",
+  { name: z.string(), who: whoSchema },
+  async ({ name, who }) => {
+    try {
+      return await serverCall(`Agent_SavePlace( ${sq(name)}, ${sq(who)} )`);
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "look_at",
+  "What a player's crosshair is on: hit position, distance, surface normal, entity (class, model, name) and zone.",
+  { who: whoSchema, distance: z.number().optional() },
+  async ({ who, distance }) => {
+    try {
+      return await serverCall(`Agent_Trace( ${sq(who)}, ${(distance ?? 20000).toFixed(1)} )`);
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "screenshot",
+  "Capture the game client window as an image (works while the window is in the background, not while minimised).",
   {
-    map: z.string().describe("Map name (e.g. 'mp_rr_canyonlands_staging', 'mp_rr_desertlands_64k_x_64k')"),
-    playlist: z.string().optional().describe("Playlist/gamemode (e.g. 'survival', 'firingrange', 'custom_tdm')"),
+    max_width: z.number().int().min(320).max(3840).optional().describe("Downscale to this width (default 1280)"),
+    save_dir: z.string().optional().describe("Also keep the JPEG in this folder"),
   },
+  async ({ max_width, save_dir }) => {
+    try {
+      const shot = await captureGameWindow(CLIENT_PROCESS, max_width ?? 1280, 80, save_dir);
+      return {
+        content: [
+          { type: "image" as const, data: shot.data, mimeType: shot.mimeType },
+          { type: "text" as const, text: JSON.stringify({ width: shot.width, height: shot.height, source: [shot.sourceWidth, shot.sourceHeight], path: shot.path || undefined }) },
+        ],
+      };
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "events",
+  "Game events since a cursor: kills, damage, connects, disconnects, respawns. Pass the returned `next` back as `since`.",
+  { since: z.number().int().optional() },
+  async ({ since }) => {
+    try {
+      return await serverCall(`Agent_Events( ${since ?? 0} )`);
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "wait_for_event",
+  "Block until a game event matches (e.g. a kill by a player), or time out. Returns the matching events.",
+  {
+    kind: z.enum(["kill", "damage", "connect", "disconnect", "respawn", "any"]).default("any"),
+    player: z.string().optional().describe("Only events naming this player (victim, attacker or player)"),
+    timeout_s: z.number().min(1).max(300).default(30),
+  },
+  async ({ kind, player, timeout_s }) => {
+    try {
+      const start = await serverLink.call("server", "Agent_Events( 0 )");
+      let cursor: number = start.next ?? 0;
+      const deadline = Date.now() + timeout_s * 1000;
+      const p = player?.toLowerCase();
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 400));
+        const r = await serverLink.call("server", `Agent_Events( ${cursor} )`);
+        cursor = r.next ?? cursor;
+        const hits = (r.events ?? []).filter(
+          (e: any) =>
+            (kind === "any" || e.kind === kind) &&
+            (!p || [e.victim, e.attacker, e.player].some((n: string | undefined) => n?.toLowerCase().includes(p)))
+        );
+        if (hits.length) return text({ ok: true, events: hits, next: cursor });
+      }
+      return failure({ ok: false, error: `no ${kind} event within ${timeout_s}s`, next: cursor });
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "logs",
+  "Recent console output of the server or client, newest last. Pass the returned `next` back as `since` to follow the log.",
+  {
+    target: z.enum(["server", "client"]).default("server"),
+    since: z.number().int().optional(),
+    max: z.number().int().min(1).max(1000).default(200),
+    level: z.enum(["all", "warn", "error"]).default("all"),
+    contains: z.string().optional().describe("Only lines containing this text (case-insensitive)"),
+  },
+  async ({ target, since, max, level, contains }) => {
+    try {
+      const r = await link(target).logs(since ?? 0, max);
+      const c = contains?.toLowerCase();
+      const lines = r.lines.filter(
+        (l: LogLine) =>
+          (level === "all" || (level === "warn" ? l.level !== "info" : l.level === "error")) && (!c || l.text.toLowerCase().includes(c))
+      );
+      return text({ ok: true, target, next: r.next, lines: lines.map((l) => `${l.seq} ${l.level === "info" ? "" : `[${l.level}] `}${l.text}`) });
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "latest_error",
+  "The most recent error on the server or client with the lines leading up to it (script errors include their call stack).",
+  { target: z.enum(["server", "client"]).default("server"), context: z.number().int().min(0).max(100).default(30) },
+  async ({ target, context }) => {
+    try {
+      const r = await link(target).logs(0, 1000);
+      let i = -1;
+      for (let k = r.lines.length - 1; k >= 0; k--) {
+        if (r.lines[k].level === "error") {
+          i = k;
+          break;
+        }
+      }
+      if (i < 0) return text({ ok: true, target, error: null, note: "no error in the last 1000 lines" });
+      let end = i;
+      while (end + 1 < r.lines.length && end - i < 20 && r.lines[end + 1].level !== "info") end++;
+      const lines = r.lines.slice(Math.max(0, i - context), end + 1);
+      return text({ ok: true, target, lines: lines.map((l) => `${l.seq} ${l.level === "info" ? "" : `[${l.level}] `}${l.text}`) });
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "catalog",
+  "What exists in this build: legends, weapons (loot refs), all loot, or the current playlist and its maps.",
+  { kind: z.enum(["legends", "weapons", "loot", "playlist"]) },
+  async ({ kind }) => {
+    try {
+      return await serverCall(`Agent_Catalog( ${sq(kind)} )`, 30000);
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+// --- act on players --------------------------------------------------------
+
+server.tool(
+  "teleport",
+  "Move player(s) to a named place ('fragment'), another player, or coordinates 'x y z'. Finds floor the player fits on.",
+  { who: whoSchema, to: z.string().describe("Place name, player name (or 'player:<name>'), or 'x y z'") },
+  async ({ who, to }) => {
+    try {
+      const r = await serverLink.call("server", `Agent_Teleport( ${sq(who)}, ${sq(to)} )`);
+      if (r.ok !== false || !String(r.error ?? "").startsWith("no place matches")) return r.ok === false ? failure(r) : text(r);
+
+      // Fall back to localized names ("Skyhook") the server cannot read.
+      const { places } = await loadPlaces();
+      const matches = matchPlaces(places, to);
+      if (!matches.length) return failure(r);
+      const best = matches[0];
+      const moved = await serverLink.call("server", `Agent_TeleportTo( ${sq(who)}, ${sqVec(best.origin)}, true )`);
+      return moved.ok === false ? failure(moved) : text({ ...moved, to: best, alternatives: matches.slice(1) });
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "give",
+  "Give an item: a weapon (e.g. mp_weapon_r97) goes into a weapon slot, anything else (ammo, armor, heals, attachments) into the inventory. See catalog for refs.",
+  { who: whoSchema, item: z.string(), count: z.number().int().min(1).max(999).default(1) },
+  async ({ who, item, count }) => {
+    try {
+      return await serverCall(`Agent_Give( ${sq(who)}, ${sq(item)}, ${count} )`);
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool("take_weapons", "Remove both main weapons from player(s).", { who: whoSchema }, async ({ who }) => {
+  try {
+    return await serverCall(`Agent_TakeWeapons( ${sq(who)} )`);
+  } catch (err) {
+    return asError(err);
+  }
+});
+
+server.tool(
+  "set_legend",
+  "Switch player(s) to a legend by name (e.g. 'wraith', 'character_bangalore').",
+  { who: whoSchema, legend: z.string() },
+  async ({ who, legend }) => {
+    try {
+      return await serverCall(`Agent_SetLegend( ${sq(who)}, ${sq(legend)} )`);
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "player",
+  "Adjust player(s): health, shield, god mode, noclip, view angles. Only the fields you pass change.",
+  {
+    who: whoSchema,
+    health: z.number().int().min(0).optional(),
+    shield: z.number().int().min(0).optional(),
+    god: z.boolean().optional(),
+    noclip: z.boolean().optional(),
+    pitch: z.number().optional().describe("View pitch in degrees (down is positive); needs yaw too"),
+    yaw: z.number().optional().describe("View yaw in degrees"),
+  },
+  async ({ who, health, shield, god, noclip, pitch, yaw }) => {
+    try {
+      const results: Record<string, unknown> = {};
+      const w = sq(who);
+      if (health !== undefined || shield !== undefined)
+        results.health = await serverLink.call("server", `Agent_SetHealth( ${w}, ${health ?? -1}, ${shield ?? -1} )`);
+      if (god !== undefined) results.god = await serverLink.call("server", `Agent_God( ${w}, ${god} )`);
+      if (noclip !== undefined) results.noclip = await serverLink.call("server", `Agent_Noclip( ${w}, ${noclip} )`);
+      if (yaw !== undefined) results.look = await serverLink.call("server", `Agent_Look( ${w}, ${sqVec([pitch ?? 0, yaw, 0])} )`);
+      if (!Object.keys(results).length) return failure({ ok: false, error: "nothing to change" });
+      const bad = Object.values(results).some((r: any) => r?.ok === false);
+      return bad ? failure(results) : text({ ok: true, ...results });
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "life",
+  "Kill or respawn player(s).",
+  { who: whoSchema, action: z.enum(["kill", "respawn"]) },
+  async ({ who, action }) => {
+    try {
+      return await serverCall(action === "kill" ? `Agent_Kill( ${sq(who)} )` : `Agent_Respawn( ${sq(who)} )`);
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "spawn",
+  "Spawn things: 'dummy' (combat dummies), 'bots' (fake players), or 'prop' (a model, e.g. mdl/barriers/concrete/concrete_barrier_01.rmdl).",
+  {
+    kind: z.enum(["dummy", "bots", "prop"]),
+    where: z.string().default("crosshair").describe("'crosshair', a place, a player name, or 'x y z' (not used for bots)"),
+    count: z.number().int().min(1).max(32).default(1),
+    shield_level: z.number().int().min(0).max(5).default(0).describe("dummy only"),
+    model: z.string().optional().describe("prop only: model path"),
+    yaw: z.number().default(0).describe("prop only"),
+  },
+  async ({ kind, where, count, shield_level, model, yaw }) => {
+    try {
+      if (kind === "bots") return await serverCall(`Agent_SpawnBots( ${count} )`);
+      if (kind === "dummy") return await serverCall(`Agent_SpawnDummy( ${sq(where)}, ${count}, ${shield_level} )`);
+      if (!model) return failure({ ok: false, error: "prop needs model" });
+      return await serverCall(`Agent_SpawnProp( ${sqAsset(model)}, ${sq(where)}, ${sqVec([0, yaw, 0])} )`);
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+server.tool(
+  "say",
+  "Show a message on screen for player(s).",
+  { text: z.string(), who: whoSchema.default("all") },
+  async ({ text: msg, who }) => {
+    try {
+      return await serverCall(`Agent_Say( ${sq(msg)}, ${sq(who)} )`);
+    } catch (err) {
+      return asError(err);
+    }
+  }
+);
+
+const INPUT_ACTIONS = ["forward", "back", "moveleft", "moveright", "jump", "duck", "attack", "zoom", "reload", "use", "speed", "melee", "offhand1", "offhand4"] as const;
+
+server.tool(
+  "input",
+  "Hold a player input on the game client for a duration (e.g. forward for 1500 ms, attack for 300 ms). 'speed' is sprint, 'offhand1' the tactical, 'offhand4' the ultimate.",
+  {
+    action: z.enum(INPUT_ACTIONS),
+    ms: z.number().int().min(16).max(30000).default(200),
+  },
+  async ({ action, ms }) => {
+    try {
+      await clientLink.command(`+${action}`);
+      await new Promise((r) => setTimeout(r, ms));
+      await clientLink.command(`-${action}`);
+      return text({ ok: true, action, ms });
+    } catch (err) {
+      try {
+        await clientLink.command(`-${action}`);
+      } catch {
+        // Release is best effort once the link is gone.
+      }
+      return asError(err);
+    }
+  }
+);
+
+// --- world and raw access -------------------------------------------------
+
+server.tool(
+  "load_map",
+  "Change the map on the dedicated server (the client follows). Optionally switch playlist first.",
+  { map: z.string().regex(/^[A-Za-z0-9_]{3,63}$/), playlist: z.string().regex(/^[A-Za-z0-9_]{1,63}$/).optional() },
   async ({ map, playlist }) => {
     try {
-      if (playlist) {
-        await rcon.exec(`sv_playlist ${playlist}`, 1000);
+      placeCache.clear();
+      const out: Record<string, unknown> = {};
+      if (playlist) out.playlist = summarizeExec(await serverLink.command(`sv_playlist ${playlist}`));
+      let loaded = false;
+      try {
+        const s = await serverLink.call("server", "Agent_State()", 5000);
+        loaded = s.ok !== false && !!s.map;
+      } catch {
+        loaded = false;
       }
-      const output = await rcon.exec(`map ${map}`, 5000);
-      return { content: [{ type: "text", text: output || `Loading map: ${map}` }] };
+      out.command = loaded ? "changelevel" : "map";
+      out.result = summarizeExec(await serverLink.command(`${out.command} ${map}`));
+      out.note = "the server VM is rebuilt during the load; call state again in a few seconds";
+      return text({ ok: true, ...out });
     } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
+      return asError(err);
     }
   }
 );
 
 server.tool(
-  "change_level",
-  "Change the current map on the running server.",
-  {
-    map: z.string().describe("Map name to change to"),
-  },
-  async ({ map }) => {
+  "console",
+  "Run console command(s) on the server or client and return what they printed. Separate several with ';'.",
+  { command: z.string(), target: z.enum(["server", "client"]).default("server") },
+  async ({ command, target }) => {
     try {
-      const output = await rcon.exec(`changelevel ${map}`, 5000);
-      return { content: [{ type: "text", text: output || `Changing level to: ${map}` }] };
+      const r = summarizeExec(await link(target).command(command));
+      return r.ok ? text(r) : failure(r);
     } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
+      return asError(err);
     }
   }
 );
 
 server.tool(
-  "stop_server",
-  "Stop the current server and disconnect all players.",
-  {},
-  async () => {
+  "convar",
+  "Read a convar, or set it when value is given. Server convars (sv_, mp_, host_) on target=server; client ones (cl_, r_, mat_, bindings) on target=client.",
+  { name: z.string().regex(/^[A-Za-z0-9_.]+$/), value: z.string().optional(), target: z.enum(["server", "client"]).default("server") },
+  async ({ name, value, target }) => {
     try {
-      const output = await rcon.exec("disconnect", 2000);
-      return { content: [{ type: "text", text: output || "Server stopped" }] };
+      const cmd = value === undefined ? name : `${name} ${value.includes(" ") ? sq(value) : value}`;
+      const r = summarizeExec(await link(target).command(cmd));
+      return r.ok ? text(r) : failure(r);
     } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
+      return asError(err);
     }
   }
 );
 
 server.tool(
-  "server_status",
-  "Get the current server status including map, players, and performance.",
-  {},
-  async () => {
+  "script",
+  "Run Squirrel on the server, client or ui VM. Return data with AgentLink_Reply( Agent_Json( value ) ); printed output and script errors come back in `output`. Agent_Help() lists the server API.",
+  { code: z.string(), vm: z.enum(["server", "client", "ui"]).default("server") },
+  async ({ code, vm }) => {
     try {
-      const output = await rcon.exec("status", 2000);
-      const status = parseStatus(output);
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(status, null, 2),
-        }],
-      };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-// --- ConVar management ---
-
-server.tool(
-  "get_convar",
-  "Get the current value of a console variable.",
-  {
-    name: z.string().describe("ConVar name"),
-  },
-  async ({ name }) => {
-    try {
-      const output = await rcon.exec(name, 1500);
-      const info = parseConVar(output);
-      if (info) {
-        return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+      const r = summarizeExec(await link(vm === "server" ? "server" : "client").evalScript(vm, code));
+      let parsed: unknown = undefined;
+      if (r.reply) {
+        try {
+          parsed = JSON.parse(r.reply);
+        } catch {
+          parsed = undefined;
+        }
       }
-      return { content: [{ type: "text", text: output || `(no output for '${name}')` }] };
+      const out = { ...r, reply: parsed ?? r.reply };
+      return r.ok ? text(out) : failure(out);
     } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
+      return asError(err);
     }
   }
 );
 
-server.tool(
-  "set_convar",
-  "Set a console variable to a new value.",
-  {
-    name: z.string().describe("ConVar name"),
-    value: z.string().describe("New value"),
-  },
-  async ({ name, value }) => {
-    try {
-      const output = await rcon.exec(`${name} ${value}`, 1500);
-      return { content: [{ type: "text", text: output || `Set ${name} = ${value}` }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
+// ---------------------------------------------------------------------------
+// Resources
+// ---------------------------------------------------------------------------
+
+server.resource("guide", "r5://guide", async (uri) => ({ contents: [{ uri: uri.href, mimeType: "text/markdown", text: GUIDE }] }));
+
+server.resource("game_state", "r5://game/state", async (uri) => {
+  let body: unknown;
+  try {
+    body = await serverLink.call("server", "Agent_State()");
+  } catch (err) {
+    body = { ok: false, error: (err as Error).message };
   }
-);
+  return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(body, null, 1) }] };
+});
 
-server.tool(
-  "find_convars",
-  "Search for console variables matching a pattern.",
-  {
-    pattern: z.string().describe("Search pattern"),
-  },
-  async ({ pattern }) => {
-    try {
-      const output = await rcon.exec(`cvarlist ${pattern}`, 3000);
-      const names = parseCvarList(output);
-      return { content: [{ type: "text", text: names.length > 0 ? names.join("\n") : output }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
+server.resource("map_places", "r5://map/places", async (uri) => {
+  let body: unknown;
+  try {
+    body = await loadPlaces();
+  } catch (err) {
+    body = { ok: false, error: (err as Error).message };
   }
-);
+  return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(body, null, 1) }] };
+});
 
-// --- Player management ---
-
-server.tool(
-  "list_players",
-  "List all connected players with details.",
-  {},
-  async () => {
-    try {
-      const output = await rcon.exec("status", 2000);
-      const status = parseStatus(output);
-      if (status.playerList.length === 0) {
-        return { content: [{ type: "text", text: `No players connected (${status.players}/${status.maxPlayers})` }] };
-      }
-      return { content: [{ type: "text", text: JSON.stringify(status.playerList, null, 2) }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
+server.resource("server_api", "r5://api/server", async (uri) => {
+  let body: unknown;
+  try {
+    body = await serverLink.call("server", "Agent_Help()");
+  } catch (err) {
+    body = { ok: false, error: (err as Error).message };
   }
-);
+  return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(body, null, 1) }] };
+});
 
-server.tool(
-  "kick_player",
-  "Kick a player from the server.",
-  {
-    target: z.string().describe("Player name or user ID"),
-    reason: z.string().optional().describe("Kick reason"),
-    byId: z.boolean().optional().describe("If true, treat target as a user ID"),
-  },
-  async ({ target, reason, byId }) => {
-    const cmd = byId ? "kickid" : "kick";
-    const reasonStr = reason ? ` "${reason}"` : "";
-    try {
-      const output = await rcon.exec(`${cmd} "${target}"${reasonStr}`, 2000);
-      return { content: [{ type: "text", text: output || `Kicked: ${target}` }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-server.tool(
-  "ban_player",
-  "Ban a player from the server.",
-  {
-    target: z.string().describe("Player name or user ID"),
-    byId: z.boolean().optional().describe("If true, treat target as a user ID"),
-  },
-  async ({ target, byId }) => {
-    const cmd = byId ? "banid" : "ban";
-    try {
-      const output = await rcon.exec(`${cmd} "${target}"`, 2000);
-      return { content: [{ type: "text", text: output || `Banned: ${target}` }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-server.tool(
-  "unban_player",
-  "Unban a player.",
-  {
-    target: z.string().describe("IP address or Steam ID to unban"),
-  },
-  async ({ target }) => {
-    try {
-      const output = await rcon.exec(`unban "${target}"`, 2000);
-      return { content: [{ type: "text", text: output || `Unbanned: ${target}` }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-// --- Chat ---
-
-server.tool(
-  "broadcast_message",
-  "Broadcast a chat message to all players (via VScript).",
-  {
-    message: z.string().describe("Message text"),
-  },
-  async ({ message }) => {
-    const escaped = message.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-    try {
-      const output = await rcon.exec(
-        `script BroadcastServerTextMessage("${escaped}")`,
-        2000
-      );
-      return { content: [{ type: "text", text: output || `Broadcast: ${message}` }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-server.tool(
-  "send_message",
-  "Send a chat message to a specific player by index (via VScript).",
-  {
-    playerIndex: z.number().describe("Player entity index"),
-    message: z.string().describe("Message text"),
-  },
-  async ({ playerIndex, message }) => {
-    const escaped = message.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-    try {
-      const output = await rcon.exec(
-        `script SendServerTextMessage(GetPlayerByIndex(${playerIndex}), "${escaped}")`,
-        2000
-      );
-      return { content: [{ type: "text", text: output || `Sent to player ${playerIndex}: ${message}` }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-// --- Playlist and maps ---
-
-server.tool(
-  "set_playlist",
-  "Set the active playlist/gamemode.",
-  {
-    playlist: z.string().describe("Playlist name (e.g. 'survival', 'firingrange', 'custom_tdm')"),
-  },
-  async ({ playlist }) => {
-    try {
-      const output = await rcon.exec(`sv_playlist ${playlist}`, 1500);
-      return { content: [{ type: "text", text: output || `Playlist set to: ${playlist}` }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-server.tool(
-  "get_playlist",
-  "Get the current active playlist.",
-  {},
-  async () => {
-    try {
-      const output = await rcon.exec("sv_playlist", 1500);
-      return { content: [{ type: "text", text: output || "(no playlist set)" }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-server.tool(
-  "list_maps",
-  "List available maps.",
-  {},
-  async () => {
-    try {
-      const output = await rcon.exec("maps *", 3000);
-      return { content: [{ type: "text", text: output || "(no maps listed)" }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-// --- Pak/Asset management ---
-
-server.tool(
-  "load_pak",
-  "Load a pak file asynchronously.",
-  {
-    pakName: z.string().describe("Pak file path (e.g. 'common.rpak')"),
-  },
-  async ({ pakName }) => {
-    try {
-      const output = await rcon.exec(`pak_requestload ${pakName}`, 5000);
-      return { content: [{ type: "text", text: output || `Requested load: ${pakName}` }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-server.tool(
-  "unload_pak",
-  "Unload a pak file by its handle.",
-  {
-    handle: z.string().describe("Pak handle ID"),
-  },
-  async ({ handle }) => {
-    try {
-      const output = await rcon.exec(`pak_requestunload ${handle}`, 3000);
-      return { content: [{ type: "text", text: output || `Requested unload: ${handle}` }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-server.tool(
-  "list_paks",
-  "List all currently loaded pak files.",
-  {},
-  async () => {
-    try {
-      const output = await rcon.exec("pak_listpaks", 3000);
-      return { content: [{ type: "text", text: output || "(no paks loaded)" }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-// --- Debug overlays ---
-
-server.tool(
-  "debug_draw_box",
-  "Draw a debug box at a position in 3D space (via VScript).",
-  {
-    x: z.number().describe("Origin X"),
-    y: z.number().describe("Origin Y"),
-    z: z.number().describe("Origin Z"),
-    minSize: z.number().optional().describe("Box min extent (default: -16)"),
-    maxSize: z.number().optional().describe("Box max extent (default: 16)"),
-    r: z.number().optional().describe("Red 0-255 (default: 255)"),
-    g: z.number().optional().describe("Green 0-255 (default: 0)"),
-    b: z.number().optional().describe("Blue 0-255 (default: 0)"),
-    duration: z.number().optional().describe("Duration in seconds (default: 10)"),
-  },
-  async (params) => {
-    const min = params.minSize ?? -16;
-    const max = params.maxSize ?? 16;
-    const r = params.r ?? 255;
-    const g = params.g ?? 0;
-    const b = params.b ?? 0;
-    const dur = params.duration ?? 10;
-    try {
-      const output = await rcon.exec(
-        `script DebugDrawBox(<${params.x}, ${params.y}, ${params.z}>, <${min}, ${min}, ${min}>, <${max}, ${max}, ${max}>, ${r}, ${g}, ${b}, 128, ${dur})`,
-        2000
-      );
-      return { content: [{ type: "text", text: output || "Box drawn" }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-server.tool(
-  "debug_draw_sphere",
-  "Draw a debug sphere at a position in 3D space (via VScript).",
-  {
-    x: z.number().describe("Origin X"),
-    y: z.number().describe("Origin Y"),
-    z: z.number().describe("Origin Z"),
-    radius: z.number().optional().describe("Sphere radius (default: 32)"),
-    r: z.number().optional().describe("Red 0-255 (default: 0)"),
-    g: z.number().optional().describe("Green 0-255 (default: 255)"),
-    b: z.number().optional().describe("Blue 0-255 (default: 0)"),
-    duration: z.number().optional().describe("Duration in seconds (default: 10)"),
-  },
-  async (params) => {
-    const radius = params.radius ?? 32;
-    const r = params.r ?? 0;
-    const g = params.g ?? 255;
-    const b = params.b ?? 0;
-    const dur = params.duration ?? 10;
-    try {
-      const output = await rcon.exec(
-        `script DebugDrawSphere(<${params.x}, ${params.y}, ${params.z}>, ${radius}, ${r}, ${g}, ${b}, 128, ${dur})`,
-        2000
-      );
-      return { content: [{ type: "text", text: output || "Sphere drawn" }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-server.tool(
-  "clear_debug_overlays",
-  "Clear all debug overlay drawings.",
-  {},
-  async () => {
-    try {
-      const output = await rcon.exec("clear_debug_overlays", 1500);
-      return { content: [{ type: "text", text: output || "Overlays cleared" }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-// --- Server visibility (pylon/master server) ---
-
-server.tool(
-  "set_server_visibility",
-  "Set the server's visibility on the master server.",
-  {
-    visibility: z.enum(["offline", "hidden", "public"]).describe("Server visibility level"),
-  },
-  async ({ visibility }) => {
-    const values = { offline: "0", hidden: "1", public: "2" };
-    try {
-      const output = await rcon.exec(
-        `pylon_host_visibility ${values[visibility]}`,
-        1500
-      );
-      return { content: [{ type: "text", text: output || `Visibility set to: ${visibility}` }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-// --- AI / Navigation (server-side VScript) ---
-
-server.tool(
-  "nav_find_nearest",
-  "Find the nearest valid navmesh position to a point (via VScript).",
-  {
-    x: z.number().describe("Position X"),
-    y: z.number().describe("Position Y"),
-    z: z.number().describe("Position Z"),
-    hull: z.number().optional().describe("Hull type index (default: 0 = small)"),
-  },
-  async (params) => {
-    const hull = params.hull ?? 0;
-    try {
-      const output = await rcon.exec(
-        `script printl(NavMesh_FindNearest(<${params.x}, ${params.y}, ${params.z}>, ${hull}))`,
-        2000
-      );
-      return { content: [{ type: "text", text: output || "(no result)" }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-// --- Mod management ---
-
-server.tool(
-  "reload_mods",
-  "Reload mod configurations.",
-  {},
-  async () => {
-    try {
-      const output = await rcon.exec("reload_mods", 3000);
-      return { content: [{ type: "text", text: output || "Mods reloaded" }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-// --- Auto-reload / Hot reload support ---
-
-server.tool(
-  "reload_scripts",
-  "Trigger a VScript auto-reload (recompile and reload all scripts).",
-  {},
-  async () => {
-    try {
-      const output = await rcon.exec("script_auto_reload 1", 2000);
-      return { content: [{ type: "text", text: output || "Script auto-reload enabled" }] };
-    } catch (err) {
-      return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
-    }
-  }
-);
-
-// ============================================================
-// RESOURCES
-// ============================================================
-
-server.resource(
-  "server_status",
-  "r5://server/status",
-  async (uri) => {
-    try {
-      const output = await rcon.exec("status", 2000);
-      const status = parseStatus(output);
-      return {
-        contents: [{
-          uri: uri.href,
-          mimeType: "application/json",
-          text: JSON.stringify(status, null, 2),
-        }],
-      };
-    } catch {
-      return {
-        contents: [{
-          uri: uri.href,
-          mimeType: "application/json",
-          text: JSON.stringify({ error: "Not connected" }),
-        }],
-      };
-    }
-  }
-);
-
-server.resource(
-  "console_log",
-  "r5://console/log",
-  async (uri) => {
-    const lines = rcon.getRecentLog(500);
-    return {
-      contents: [{
-        uri: uri.href,
-        mimeType: "text/plain",
-        text: lines.join("") || "(empty log)",
-      }],
-    };
-  }
-);
-
-server.resource(
-  "connection_info",
-  "r5://connection",
-  async (uri) => {
-    return {
-      contents: [{
-        uri: uri.href,
-        mimeType: "application/json",
-        text: JSON.stringify({
-          connected: rcon.isConnected(),
-          host: (rcon as any).config.host,
-          port: (rcon as any).config.port,
-        }, null, 2),
-      }],
-    };
-  }
-);
-
-// ============================================================
-// Entrypoint
-// ============================================================
+// ---------------------------------------------------------------------------
 
 async function main() {
-  // Auto-connect if password is provided
-  if (RCON_PASSWORD) {
-    try {
-      await rcon.connect();
-      process.stderr.write(
-        `[r5sdk-mcp] Connected to ${RCON_HOST}:${RCON_PORT}\n`
-      );
-    } catch (err) {
-      process.stderr.write(
-        `[r5sdk-mcp] Auto-connect failed: ${(err as Error).message}\n`
-      );
-      process.stderr.write(
-        "[r5sdk-mcp] Use the 'connect' tool to connect manually.\n"
-      );
-    }
-  }
-
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("[r5sdk-mcp] MCP server started on stdio\n");
+  process.stderr.write(`[r5sdk-mcp] ready (game dir ${GAME_DIR}; links connect on first use)\n`);
 }
 
 main().catch((err) => {
-  process.stderr.write(`[r5sdk-mcp] Fatal: ${err}\n`);
+  process.stderr.write(`[r5sdk-mcp] fatal: ${err}\n`);
   process.exit(1);
 });
