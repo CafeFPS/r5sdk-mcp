@@ -4,6 +4,7 @@
 //   AUTH <token>                          -> OK | ERR ...
 //   INFO <id>                             -> RESULT <id> ok {...}
 //   EVAL <id> <server|client|ui> <code>   -> RESULT <id> ok|err {ran,error,reply,log,...}
+//   EVAL64 <id> <server|client|ui> <b64>  (same; the code keeps its newlines)
 //   CMD  <id> <console line>              -> RESULT <id> ok {ran,error,reply,log}
 //   LOG  <id> <sinceSeq> [max]            -> RESULT <id> ok {lines,next}
 //
@@ -46,6 +47,8 @@ interface Pending {
 }
 
 const CONNECT_TIMEOUT_MS = 3000;
+// The game refuses longer lines.
+const MAX_LINE = 65536;
 
 export class LinkError extends Error {}
 
@@ -207,12 +210,15 @@ export class AgentLink {
     const id = `r${this.nextId++}`;
     const line = `${op} ${id}${args ? " " + args : ""}`;
     if (line.includes("\n")) throw new LinkError("request must be a single line");
+    if (Buffer.byteLength(line, "utf8") > MAX_LINE)
+      throw new LinkError(`request is ${Buffer.byteLength(line, "utf8")} bytes; the link accepts at most ${MAX_LINE}`);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(
           new LinkError(
-            `${this.describe()}: ${op} timed out after ${timeoutMs} ms (the game may be loading a map or paused)`
+            `${this.describe()}: ${op} timed out after ${timeoutMs} ms (the game may be loading a map or paused). ` +
+              "The request stays queued in the game and may still run later."
           )
         );
       }, timeoutMs);
@@ -226,8 +232,9 @@ export class AgentLink {
   }
 
   async evalScript(vm: "server" | "client" | "ui", code: string, timeoutMs?: number): Promise<ExecResult> {
-    const oneLine = code.replace(/\r?\n/g, " ");
-    const r = await this.request("EVAL", `${vm} ${oneLine}`, timeoutMs);
+    // Base64 keeps newlines, so // comments do not swallow the rest of the script.
+    const b64 = Buffer.from(code, "utf8").toString("base64");
+    const r = await this.request("EVAL64", `${vm} ${b64}`, timeoutMs);
     return { ok: r.ok, logDropped: 0, log: [], reply: null, ran: false, error: !r.ok, ...r.payload };
   }
 

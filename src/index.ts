@@ -18,18 +18,26 @@ function env(name: string, fallback: string): string {
 const GAME_DIR = env("R5_GAME_DIR", process.cwd());
 const PLATFORM_DIR = path.join(GAME_DIR, "platform");
 
+// The game names the token after its port when it is not the default one.
+function tokenFile(role: "server" | "client", port: number, defaultPort: number, defaultName: string): string {
+  return path.join(PLATFORM_DIR, port === defaultPort ? defaultName : `agentlink_${role}_${port}.token`);
+}
+
+const SERVER_PORT = Number(env("R5_SERVER_LINK_PORT", "37019"));
+const CLIENT_PORT = Number(env("R5_CLIENT_LINK_PORT", "37020"));
+
 const serverLink = new AgentLink({
   role: "server",
   host: "127.0.0.1",
-  port: Number(env("R5_SERVER_LINK_PORT", "37019")),
-  tokenFile: env("R5_SERVER_TOKEN_FILE", path.join(PLATFORM_DIR, "agentlink.token")),
+  port: SERVER_PORT,
+  tokenFile: env("R5_SERVER_TOKEN_FILE", tokenFile("server", SERVER_PORT, 37019, "agentlink.token")),
 });
 
 const clientLink = new AgentLink({
   role: "client",
   host: "127.0.0.1",
-  port: Number(env("R5_CLIENT_LINK_PORT", "37020")),
-  tokenFile: env("R5_CLIENT_TOKEN_FILE", path.join(PLATFORM_DIR, "agentlink_client.token")),
+  port: CLIENT_PORT,
+  tokenFile: env("R5_CLIENT_TOKEN_FILE", tokenFile("client", CLIENT_PORT, 37020, "agentlink_client.token")),
 });
 
 const CLIENT_PROCESS = env("R5_CLIENT_PROCESS", "r5apex");
@@ -58,10 +66,11 @@ function asError(err: unknown) {
 
 // Squirrel string literal.
 function sq(s: string): string {
-  return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r?\n/g, " ") + '"';
+  return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\x00-\x1f\x7f]/g, " ") + '"';
 }
 
 function sqVec(v: [number, number, number]): string {
+  if (!v.every((n) => Number.isFinite(Number(n)))) throw new Error(`vector has a non-finite component: ${JSON.stringify(v)}`);
   return `<${v.map((n) => Number(n).toFixed(3)).join(", ")}>`;
 }
 
@@ -114,7 +123,8 @@ async function loadPlaces(): Promise<{ map: string; places: Place[] }> {
   const map: string = r.map;
   const places: Place[] = r.places;
   const cached = placeCache.get(map);
-  if (cached && cached.length === places.length) return { map, places: cached };
+  const cacheHasNames = cached?.some((p) => p.displayName !== undefined) ?? false;
+  if (cached && cached.length === places.length && (cacheHasNames || !clientLink.isConnected())) return { map, places: cached };
 
   const tokens = places.map((p) => p.token).filter((t) => t.startsWith("#"));
   if (tokens.length && clientLink.isConnected()) {
@@ -270,7 +280,7 @@ server.tool(
 server.tool(
   "look_at",
   "What a player's crosshair is on: hit position, distance, surface normal, entity (class, model, name) and zone.",
-  { who: whoSchema, distance: z.number().optional() },
+  { who: whoSchema, distance: z.number().finite().positive().max(100000).optional() },
   async ({ who, distance }) => {
     try {
       return await serverCall(`Agent_Trace( ${sq(who)}, ${(distance ?? 20000).toFixed(1)} )`);
@@ -477,8 +487,8 @@ server.tool(
     shield: z.number().int().min(0).optional(),
     god: z.boolean().optional(),
     noclip: z.boolean().optional(),
-    pitch: z.number().optional().describe("View pitch in degrees (down is positive); needs yaw too"),
-    yaw: z.number().optional().describe("View yaw in degrees"),
+    pitch: z.number().finite().min(-90).max(90).optional().describe("View pitch in degrees (down is positive); needs yaw too"),
+    yaw: z.number().finite().optional().describe("View yaw in degrees"),
   },
   async ({ who, health, shield, god, noclip, pitch, yaw }) => {
     try {
@@ -520,7 +530,7 @@ server.tool(
     count: z.number().int().min(1).max(32).default(1),
     shield_level: z.number().int().min(0).max(5).default(0).describe("dummy only"),
     model: z.string().optional().describe("prop only: model path"),
-    yaw: z.number().default(0).describe("prop only"),
+    yaw: z.number().finite().default(0).describe("prop only"),
   },
   async ({ kind, where, count, shield_level, model, yaw }) => {
     try {
